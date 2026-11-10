@@ -14,7 +14,7 @@ on:
 
 jobs:
   macos-m1-desktop:
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 90
 
     steps:
