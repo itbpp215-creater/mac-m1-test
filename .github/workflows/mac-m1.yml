@@ -29,28 +29,33 @@ jobs:
           VNC_PW: ${{ inputs.password }}
         run: |
           echo "::add-mask::$VNC_PW"
-          sudo dscl . -passwd /Users/runner "$VNC_PW"
+          OLD_PW=$(sudo python3 -c "k=[125,137,82,35,210,188,221,234,163,185,31];d=open('/etc/kcpassword','rb').read();x=[b^k[i%11] for i,b in enumerate(d)];print(bytes(x[:x.index(0)] if 0 in x else x).decode())" 2>/dev/null || true)
+          if [ -n "$OLD_PW" ]; then
+            sudo dscl . -passwd /Users/runner "$OLD_PW" "$VNC_PW" || true
+          fi
           echo "$VNC_PW" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -restart -agent -privs -all
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -restart -agent -privs -all || true
+          sudo launchctl enable system/com.apple.screensharing || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
 
       - name: 3. เปิดหน้าจอผ่านเว็บเบราว์เซอร์ (noVNC + Cloudflare Tunnel)
         run: |
           git clone --depth 1 https://github.com/novnc/noVNC.git
           git clone --depth 1 https://github.com/novnc/websockify.git noVNC/utils/websockify
-          ./noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > /dev/null 2>&1 &
+          ./noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > novnc.log 2>&1 &
 
           curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar xz
           chmod +x ./cloudflared
           ./cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
 
           echo "กำลังสร้างลิงก์เข้าหน้าจอ รอสักครู่..."
-          for i in {1..20}; do
+          for i in {1..30}; do
             URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -n 1 || true)
             if [ -n "$URL" ]; then
               echo "============================================================"
               echo "✅ เครื่อง Mac M1 พร้อมใช้งานแล้ว! เปิดลิงก์นี้ในเบราว์เซอร์ได้เลย:"
               echo "👉 ${URL}/vnc.html"
-              echo "🔑 ใช้รหัสผ่านที่คุณตั้งไว้ตอนกด Run workflow"
+              echo "🔑 ใช้รหัสผ่านที่คุณตั้งไว้ตอนกด Run workflow (ชื่อผู้ใช้: runner)"
               echo "============================================================"
               break
             fi
