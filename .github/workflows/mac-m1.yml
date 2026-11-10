@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       password:
-        description: 'ตั้งรหัสผ่านสำหรับเข้าหน้าจอ Mac (อย่างน้อย 8 ตัวอักษร)'
+        description: 'ตั้งรหัสผ่านสำหรับเข้าหน้าจอ Mac'
         required: true
         default: 'MacM1234'
       duration:
@@ -24,26 +24,225 @@ jobs:
           sysctl -n machdep.cpu.brand_string
           sw_vers
 
-      - name: 2. เปิดระบบหน้าจอ VNC และตั้งรหัสผ่าน
-        env:
-          VNC_PW: ${{ inputs.password }}
+      - name: 2. เตรียมระบบควบคุมหน้าจอ Mac M1 (แก้จอดำ macOS 15)
         run: |
-          echo "::add-mask::$VNC_PW"
-          OLD_PW=$(sudo python3 -c "k=[125,137,82,35,210,188,221,234,163,185,31];d=open('/etc/kcpassword','rb').read();x=[b^k[i%11] for i,b in enumerate(d)];print(bytes(x[:x.index(0)] if 0 in x else x).decode())" 2>/dev/null || true)
-          if [ -n "$OLD_PW" ]; then
-            sudo dscl . -passwd /Users/runner "$OLD_PW" "$VNC_PW" || true
-          fi
-          echo "$VNC_PW" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -restart -agent -privs -all || true
-          sudo launchctl enable system/com.apple.screensharing || true
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
+          caffeinate -u -d -i -m -s &
+          cat << 'EOF' > macinput.c
+          #include <ApplicationServices/ApplicationServices.h>
+          #include <CoreFoundation/CoreFoundation.h>
+          #include <unistd.h>
+          #include <stdlib.h>
+          #include <string.h>
 
-      - name: 3. เปิดหน้าจอผ่านเว็บเบราว์เซอร์ (noVNC + Cloudflare Tunnel)
+          int main(int argc, char *argv[]) {
+              if (argc < 2) return 0;
+              CGDirectDisplayID disp = CGMainDisplayID();
+              double w = (double)CGDisplayPixelsWide(disp);
+              double h = (double)CGDisplayPixelsHigh(disp);
+              const char *cmd = argv[1];
+
+              if ((strcmp(cmd, "click") == 0 || strcmp(cmd, "dblclick") == 0 || strcmp(cmd, "rclick") == 0) && argc >= 4) {
+                  CGPoint pt = CGPointMake(atof(argv[2]) * w, atof(argv[3]) * h);
+                  if (strcmp(cmd, "rclick") == 0) {
+                      CGEventRef d = CGEventCreateMouseEvent(NULL, kCGEventRightMouseDown, pt, kCGMouseButtonRight);
+                      CGEventRef u = CGEventCreateMouseEvent(NULL, kCGEventRightMouseUp, pt, kCGMouseButtonRight);
+                      CGEventPost(kCGHIDEventTap, d); usleep(30000); CGEventPost(kCGHIDEventTap, u);
+                      CFRelease(d); CFRelease(u);
+                  } else {
+                      CGEventRef d = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, pt, kCGMouseButtonLeft);
+                      CGEventRef u = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft);
+                      CGEventPost(kCGHIDEventTap, d); usleep(30000); CGEventPost(kCGHIDEventTap, u);
+                      if (strcmp(cmd, "dblclick") == 0) {
+                          usleep(40000);
+                          CGEventSetIntegerValueField(d, kCGMouseEventClickState, 2);
+                          CGEventSetIntegerValueField(u, kCGMouseEventClickState, 2);
+                          CGEventPost(kCGHIDEventTap, d); usleep(30000); CGEventPost(kCGHIDEventTap, u);
+                      }
+                      CFRelease(d); CFRelease(u);
+                  }
+              } else if (strcmp(cmd, "key") == 0 && argc >= 3) {
+                  int kc = atoi(argv[2]);
+                  CGEventRef d = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)kc, true);
+                  CGEventRef u = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)kc, false);
+                  CGEventPost(kCGHIDEventTap, d); usleep(20000); CGEventPost(kCGHIDEventTap, u);
+                  CFRelease(d); CFRelease(u);
+              } else if (strcmp(cmd, "text") == 0 && argc >= 3) {
+                  CFStringRef cfs = CFStringCreateWithCString(NULL, argv[2], kCFStringEncodingUTF8);
+                  if (cfs) {
+                      CFIndex len = CFStringGetLength(cfs);
+                      UniChar *buf = (UniChar *)malloc(sizeof(UniChar) * (len + 1));
+                      CFStringGetCharacters(cfs, CFRangeMake(0, len), buf);
+                      CGEventRef d = CGEventCreateKeyboardEvent(NULL, 0, true);
+                      CGEventRef u = CGEventCreateKeyboardEvent(NULL, 0, false);
+                      CGEventKeyboardSetUnicodeString(d, len, buf);
+                      CGEventKeyboardSetUnicodeString(u, len, buf);
+                      CGEventPost(kCGHIDEventTap, d); usleep(20000); CGEventPost(kCGHIDEventTap, u);
+                      CFRelease(d); CFRelease(u); free(buf); CFRelease(cfs);
+                  }
+              }
+              return 0;
+          }
+          EOF
+          clang -framework ApplicationServices -framework CoreFoundation macinput.c -o macinput
+
+          cat << 'EOF' > server.py
+          import os, sys, json, subprocess, urllib.parse
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          PW = os.environ.get("VNC_PW", "MacM1234")
+          DESKTOP = os.path.expanduser("~/Desktop")
+
+          HTML = """<!DOCTYPE html>
+          <html><head><meta charset="utf-8"><title>Mac M1 Web Desktop</title>
+          <style>
+            body { margin:0; background:#111; color:#eee; font-family:sans-serif; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+            #bar { background:#1e1e24; padding:8px 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; border-bottom:1px solid #333; font-size:13px; }
+            button, label.btn { background:#2b6cb0; color:#fff; border:none; padding:6px 10px; border-radius:5px; cursor:pointer; font-size:13px; }
+            button:hover, label.btn:hover { background:#3182ce; }
+            input[type=text] { background:#222; color:#fff; border:1px solid #444; padding:5px 8px; border-radius:4px; }
+            #wrap { flex:1; display:flex; justify-content:center; align-items:center; overflow:auto; position:relative; }
+            #screen { max-width:100%; max-height:100%; cursor:crosshair; user-select:none; -webkit-user-drag:none; }
+            #status { color:#68d391; margin-left:auto; font-size:12px; }
+          </style></head><body>
+          <div id="bar">
+            <strong>🍎 Mac M1</strong>
+            <button onclick="cmd('open -a Finder')">เปิด Finder</button>
+            <button onclick="cmd('open -a Safari')">เปิด Safari</button>
+            <button onclick="cmd('open -a Terminal')">เปิด Terminal</button>
+            <label class="btn">📁 อัปโหลดไฟล์เข้า Mac (.dmg/.zip/.pkg)
+              <input type="file" id="fup" style="display:none" onchange="uploadFile(this)">
+            </label>
+            <input type="text" id="txt" placeholder="พิมพ์ข้อความส่งเข้า Mac..." onkeydown="if(event.key==='Enter')sendText()">
+            <button onclick="sendText()">พิมพ์</button>
+            <button onclick="sendKey(36)">Enter</button>
+            <button onclick="sendKey(51)">Backspace</button>
+            <input type="text" id="sh" placeholder="รันคำสั่ง Terminal เช่น ls -la ~/Desktop" style="width:220px" onkeydown="if(event.key==='Enter')runSh()">
+            <button onclick="runSh()">รันคำสั่ง</button>
+            <span id="status">พร้อมใช้งาน (คลิกซ้าย=1ครั้ง | ดับเบิลคลิก=เปิดแอป | คลิกขวา=เมนู)</span>
+          </div>
+          <div id="wrap"><img id="screen" src="/frame.jpg" oncontextmenu="return false;"></div>
+          <script>
+            const img = document.getElementById('screen');
+            const st = document.getElementById('status');
+            let busy = false;
+            setInterval(() => {
+              if (!busy) {
+                busy = true;
+                const next = new Image();
+                next.onload = () => { img.src = next.src; busy = false; };
+                next.onerror = () => { busy = false; };
+                next.src = '/frame.jpg?t=' + Date.now();
+              }
+            }, 350);
+
+            function pos(e) {
+              const r = img.getBoundingClientRect();
+              return { x: ((e.clientX - r.left) / r.width).toFixed(4), y: ((e.clientY - r.top) / r.height).toFixed(4) };
+            }
+            let clickTimer = null;
+            img.addEventListener('click', e => {
+              const p = pos(e);
+              if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; return; }
+              clickTimer = setTimeout(() => {
+                clickTimer = null;
+                fetch('/input', {method:'POST', body:JSON.stringify({type:'click', x:p.x, y:p.y})});
+              }, 220);
+            });
+            img.addEventListener('dblclick', e => {
+              if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+              const p = pos(e);
+              fetch('/input', {method:'POST', body:JSON.stringify({type:'dblclick', x:p.x, y:p.y})});
+            });
+            img.addEventListener('contextmenu', e => {
+              e.preventDefault();
+              const p = pos(e);
+              fetch('/input', {method:'POST', body:JSON.stringify({type:'rclick', x:p.x, y:p.y})});
+            });
+            function sendText() {
+              const el = document.getElementById('txt');
+              if (!el.value) return;
+              fetch('/input', {method:'POST', body:JSON.stringify({type:'text', text:el.value})});
+              el.value = '';
+            }
+            function sendKey(k) { fetch('/input', {method:'POST', body:JSON.stringify({type:'key', key:k})}); }
+            function cmd(c) { fetch('/cmd', {method:'POST', body:JSON.stringify({cmd:c})}); }
+            function runSh() {
+              const el = document.getElementById('sh');
+              if (!el.value) return;
+              st.textContent = 'กำลังรัน: ' + el.value;
+              fetch('/cmd', {method:'POST', body:JSON.stringify({cmd:el.value})}).then(r=>r.text()).then(t=>{ st.textContent = t || 'รันสำเร็จ'; });
+              el.value = '';
+            }
+            function uploadFile(input) {
+              const f = input.files[0];
+              if (!f) return;
+              st.textContent = 'กำลังอัปโหลด ' + f.name + ' ...';
+              fetch('/upload?name=' + encodeURIComponent(f.name), {method:'POST', body:f})
+                .then(r => r.text()).then(t => { st.textContent = t; input.value = ''; });
+            }
+          </script></body></html>"""
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, format, *args): pass
+              def do_GET(self):
+                  if self.path.startswith('/frame.jpg'):
+                      subprocess.run(['/usr/sbin/screencapture', '-C', '-x', '-t', 'jpg', '/tmp/frame.jpg'])
+                      if os.path.exists('/tmp/frame.jpg'):
+                          with open('/tmp/frame.jpg', 'rb') as f: data = f.read()
+                          self.send_response(200)
+                          self.send_header('Content-Type', 'image/jpeg')
+                          self.send_header('Cache-Control', 'no-store')
+                          self.end_headers()
+                          self.wfile.write(data)
+                          return
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'text/html; charset=utf-8')
+                  self.end_headers()
+                  self.wfile.write(HTML.encode('utf-8'))
+
+              def do_POST(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  if self.path.startswith('/upload'):
+                      q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                      name = os.path.basename(q.get('name', ['uploaded.bin'])[0])
+                      dest = os.path.join(DESKTOP, name)
+                      with open(dest, 'wb') as f: f.write(self.rfile.read(length))
+                      subprocess.run(['xattr', '-cr', dest])
+                      if name.lower().endswith('.dmg'):
+                          subprocess.Popen(['hdiutil', 'attach', dest])
+                          subprocess.Popen(['open', DESKTOP])
+                      elif name.lower().endswith('.zip'):
+                          subprocess.run(['ditto', '-x', '-k', dest, DESKTOP])
+                          subprocess.run(['xattr', '-cr', DESKTOP])
+                          subprocess.Popen(['open', DESKTOP])
+                      else:
+                          subprocess.Popen(['open', '-R', dest])
+                      self.send_response(200); self.end_headers()
+                      self.wfile.write(f'อัปโหลดและเปิด {name} บน Desktop สำเร็จ!'.encode('utf-8'))
+                      return
+
+                  body = json.loads(self.rfile.read(length).decode('utf-8'))
+                  if self.path == '/input':
+                      t = body.get('type')
+                      if t in ('click', 'dblclick', 'rclick'):
+                          subprocess.run(['./macinput', t, str(body['x']), str(body['y'])])
+                      elif t == 'key':
+                          subprocess.run(['./macinput', 'key', str(body['key'])])
+                      elif t == 'text':
+                          subprocess.run(['./macinput', 'text', str(body['text'])])
+                      self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                  elif self.path == '/cmd':
+                      res = subprocess.run(body['cmd'], shell=True, capture_output=True, text=True)
+                      out = (res.stdout + res.stderr).strip()[:120]
+                      self.send_response(200); self.end_headers(); self.wfile.write(out.encode('utf-8'))
+
+          subprocess.Popen(['open', '-a', 'Finder'])
+          ThreadingHTTPServer(('127.0.0.1', 6080), Handler).serve_forever()
+          EOF
+          python3 server.py &
+
+      - name: 3. เปิดลิงก์เข้าหน้าจอผ่านเว็บเบราว์เซอร์ (Cloudflare Tunnel)
         run: |
-          git clone --depth 1 https://github.com/novnc/noVNC.git
-          git clone --depth 1 https://github.com/novnc/websockify.git noVNC/utils/websockify
-          ./noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > novnc.log 2>&1 &
-
           curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar xz
           chmod +x ./cloudflared
           ./cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
@@ -53,9 +252,8 @@ jobs:
             URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -n 1 || true)
             if [ -n "$URL" ]; then
               echo "============================================================"
-              echo "✅ เครื่อง Mac M1 พร้อมใช้งานแล้ว! เปิดลิงก์นี้ในเบราว์เซอร์ได้เลย:"
-              echo "👉 ${URL}/vnc.html"
-              echo "🔑 ใช้รหัสผ่านที่คุณตั้งไว้ตอนกด Run workflow (ชื่อผู้ใช้: runner)"
+              echo "✅ เครื่อง Mac M1 พร้อมใช้งานแล้ว! คลิกเปิดลิงก์นี้ได้เลย:"
+              echo "👉 ${URL}"
               echo "============================================================"
               break
             fi
