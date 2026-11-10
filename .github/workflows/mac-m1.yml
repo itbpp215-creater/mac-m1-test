@@ -1,0 +1,59 @@
+name: Mac M1 Remote Desktop (Browser VNC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'ตั้งรหัสผ่านสำหรับเข้าหน้าจอ Mac (อย่างน้อย 8 ตัวอักษร)'
+        required: true
+        default: 'MacM1234'
+      duration:
+        description: 'เวลาที่ต้องการเปิดเครื่องไว้ (นาที)'
+        required: true
+        default: '45'
+
+jobs:
+  macos-m1-desktop:
+    runs-on: macos-14 # macos-14 และ macos-15 คือเครื่อง Apple M1 (arm64) แท้
+    timeout-minutes: 90
+
+    steps:
+      - name: 1. เช็กสเปกชิป Apple Silicon
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+
+      - name: 2. เปิดระบบหน้าจอ VNC และตั้งรหัสผ่าน
+        env:
+          VNC_PW: ${{ inputs.password }}
+        run: |
+          sudo dscl . -passwd /Users/runner "$VNC_PW"
+          echo "$VNC_PW" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -restart -agent -privs -all
+
+      - name: 3. เปิดหน้าจอผ่านเว็บเบราว์เซอร์ (noVNC + Cloudflare Tunnel)
+        run: |
+          git clone --depth 1 https://github.com/novnc/noVNC.git
+          git clone --depth 1 https://github.com/novnc/websockify.git noVNC/utils/websockify
+          ./noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > /dev/null 2>&1 &
+
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz | tar xz
+          chmod +x ./cloudflared
+          ./cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+
+          echo "กำลังสร้างลิงก์เข้าหน้าจอ รอสักครู่..."
+          for i in {1..20}; do
+            URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$URL" ]; then
+              echo "============================================================"
+              echo "✅ เครื่อง Mac M1 พร้อมใช้งานแล้ว! เปิดลิงก์นี้ในเบราว์เซอร์ได้เลย:"
+              echo "👉 ${URL}/vnc.html"
+              echo "🔑 รหัสผ่าน VNC และรหัสล็อกอินเครื่อง: ${{ inputs.password }}"
+              echo "============================================================"
+              break
+            fi
+            sleep 2
+          done
+
+          sleep $(( ${{ inputs.duration }} * 60 ))
